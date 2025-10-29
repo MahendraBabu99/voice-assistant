@@ -8,40 +8,69 @@ import json
 import os
 import math
 from pathlib import Path
+import csv
 
-# 1. Load DailyDialog dataset
-import json
-with open("C:/Users/chapa mahindra/.vscode/tfenv/daily_dialog_extracted.json", "r", encoding="utf-8") as f:
-    ds = json.load(f)
-print(ds.keys())
-dialogs = ds["dialog"]
+# 1. Load and prepare dataset correctly
+data_path = r"C:\Users\chapa mahindra\Downloads\archive\Conversation.csv"
 
-print("✅ Loaded dialogs:", len(dialogs))
+def load_conversation_data(data_path):
+    dialogs = []
+    with open(data_path, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            # Extract question and answer
+            q = row.get('question') or row.get('Question') or list(row.values())[0]
+            a = row.get('answer') or row.get('Answer') or list(row.values())[1]
+            
+            if q and a:
+                # Create conversation pairs
+                dialogs.append([q.strip(), a.strip()])
+    return dialogs
+
+# Load the data
+dialogs = load_conversation_data(data_path)
 
 
-
-# 2. Build Tokenizer (BPE)
+# 2. Build tokenizer
 def build_tokenizer(sentences, path="chat_tokenizer.json"):
-    tokenizer = Tokenizer(models.BPE(unk_token='[UNK]'))
-    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
-    trainer = trainers.BpeTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"])
-    tokenizer.train_from_iterator(sentences, trainer)
-    tokenizer.save(path)
+    if os.path.exists(path):
+        tokenizer = Tokenizer.from_file(path)
+    else:
+        tokenizer = Tokenizer(models.BPE(unk_token='[UNK]'))
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        trainer = trainers.BpeTrainer(special_tokens=["[UNK]", "[PAD]", "[SOS]", "[EOS]"])
+        tokenizer.train_from_iterator(sentences, trainer)
+        tokenizer.save(path)
     return tokenizer
 
-sentences = [sentence for dialog in dialogs for sentence in dialog]
-tokenizer = build_tokenizer(sentences)
+# Prepare sentences for tokenizer training
+sentences = []
+for dialog in dialogs:
+    sentences.extend(dialog)
 
-# 3. Dataset
+tokenizer = build_tokenizer(sentences)
+vocab_size = tokenizer.get_vocab_size()
+# print(f"Tokenizer vocab size: {vocab_size}")
+
+# 3. Improved Dataset class
 class ChatDataset(Dataset):
     def __init__(self, conversations, tokenizer, max_len=50):
         self.data = []
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        
         for dialog in conversations:
-            for i in range(len(dialog) - 1):
-                src_ids = tokenizer.encode(dialog[i]).ids[:max_len-2]
-                tgt_ids = tokenizer.encode(dialog[i+1]).ids[:max_len-2]
+            if len(dialog) >= 2:  # Ensure we have at least a question and answer
+                # Encode source (question) and target (answer)
+                src_encoding = tokenizer.encode(dialog[0])
+                tgt_encoding = tokenizer.encode(dialog[1])
+                
+                # Truncate if necessary and add special tokens
+                src_ids = src_encoding.ids[:max_len-2]  # Reserve space for [SOS] and [EOS]
+                tgt_ids = tgt_encoding.ids[:max_len-2]
+                
                 self.data.append({
-                    "src": [1] + src_ids + [2],  # [SOS] and [EOS]
+                    "src": [1] + src_ids + [2],  # [SOS] = 1, [EOS] = 2
                     "tgt": [1] + tgt_ids + [2]
                 })
 
@@ -54,18 +83,21 @@ class ChatDataset(Dataset):
             torch.tensor(self.data[idx]["tgt"], dtype=torch.long)
         )
 
+# Create dataset
 chat_dataset = ChatDataset(dialogs, tokenizer)
-print("📚 Total training pairs:", len(chat_dataset))
+# print(f"Dataset size: {len(chat_dataset)}")
 
-# 4. Collate Function
+# 4. Collate function
 def collate_fn(batch):
     src_batch = [x[0] for x in batch]
     tgt_batch = [x[1] for x in batch]
-    return (
-        pad_sequence(src_batch, batch_first=True, padding_value=0),
-        pad_sequence(tgt_batch, batch_first=True, padding_value=0)
-    )
+    
+    src_padded = pad_sequence(src_batch, batch_first=True, padding_value=0)
+    tgt_padded = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
+    
+    return src_padded, tgt_padded
 
+# Create data loader
 train_loader = DataLoader(chat_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
 
 class Embeddings(nn.Module):
@@ -277,83 +309,90 @@ class Transformer(nn.Module):
                     nn.init.xavier_uniform_(p)
 
             return model
+
+
+# 6. Initialize model
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# print(f"Using device: {device}")
+
 model = Transformer.build_transformer(
-    src_vocab_size=len(tokenizer.get_vocab()),
-    tgt_vocab_size=len(tokenizer.get_vocab()),
+    src_vocab_size=vocab_size,
+    tgt_vocab_size=vocab_size,
     src_seq_len=50,
     tgt_seq_len=50,
     d_model=256,
     N=2,
     h=4,
     d_ff=1024
-)
+).to(device)
 
+# 7. Improved training setup
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+# Use CrossEntropyLoss instead of NLLLoss for better stability
+loss_fn = nn.CrossEntropyLoss(ignore_index=0)
 
-
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
-
-from torch.utils.data import DataLoader
-
-chat_dataset = ChatDataset(ds["dialog"], tokenizer)
-from torch.nn.utils.rnn import pad_sequence
-
-def collate_fn(batch):
-        src_batch = [x[0] for x in batch]
-        tgt_batch = [x[1] for x in batch]
-        src_padded = pad_sequence(src_batch, batch_first=True, padding_value=0)
-        tgt_padded = pad_sequence(tgt_batch, batch_first=True, padding_value=0)
-        return src_padded, tgt_padded
-
-train_loader = DataLoader(chat_dataset, batch_size=32, shuffle=True, collate_fn=collate_fn)
-
-import torch.nn as nn
-optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-loss_fn = nn.NLLLoss(ignore_index=0)  # [PAD] assumed to be  should i paste up to ths
-# 5. Transformer (paste your full class definitions here before this line)
-
-# Place your Transformer and helper classes here...
-
-
-print("✅ Model initialized.")
-print(f"✅ Using device: {device}")
-if device.type == 'cuda':
-    print(torch.cuda.get_device_name(0))
-
-    # train the model
+# print("Training started...")
 if __name__ == "__main__":
-# 7. Training
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
-    loss_fn = nn.NLLLoss(ignore_index=0)
-
-    print("training is started")
-    for epoch in range(5):
-        print(f"🚀 Epoch {epoch+1} started")
+# 8. Training loop with improvements
+    for epoch in range(20):
         model.train()
         total_loss = 0
-        for src, tgt in train_loader:
-            src,tgt = src.to(device, non_blocking=True), tgt.to(device,non_blocking=True)
-            tgt_input = tgt[:, :-1]
-            tgt_output = tgt[:, 1:]
-            src_mask = (src != 0).unsqueeze(1).unsqueeze(2)
-            tgt_mask = torch.tril(torch.ones(tgt_input.size(1), tgt_input.size(1))).bool().unsqueeze(0).to(device)
-
+        batch_count = 0
+        
+        for batch_idx, (src, tgt) in enumerate(train_loader):
+            src = src.to(device)
+            tgt = tgt.to(device)
+            
+            # Prepare input and target sequences
+            tgt_input = tgt[:, :-1]   # Remove last token for input
+            tgt_output = tgt[:, 1:]   # Remove first token for target
+            
+            # Create masks
+            src_mask = (src != 0).unsqueeze(1).unsqueeze(2).to(device)
+            
+            # Create causal mask for decoder
+            seq_len = tgt_input.size(1)
+            tgt_mask = torch.tril(torch.ones(seq_len, seq_len)).bool().unsqueeze(0).to(device)
+            
+            # Forward pass
             enc_out = model.encode(src, src_mask)
             dec_out = model.decode(enc_out, src_mask, tgt_input, tgt_mask)
             logits = model.project(dec_out)
-
-            loss = loss_fn(logits.view(-1, logits.size(-1)), tgt_output.reshape(-1))
-
+            
+            # Calculate loss
+            loss = loss_fn(logits.reshape(-1, logits.size(-1)), tgt_output.reshape(-1))
+            
+            # Backward pass
             optimizer.zero_grad()
             loss.backward()
+            
+            # Gradient clipping to prevent explosions
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             optimizer.step()
-
+            
             total_loss += loss.item()
+            batch_count += 1
+            
+            if batch_idx % 10 == 0:
+                print(f"Batch {batch_idx}, Loss: {loss.item():.4f}")
+        
+        avg_loss = total_loss / batch_count
+        print(f"📘 Epoch {epoch+1}: Average Loss = {avg_loss:.4f}")
 
-        print(f"📘 Epoch {epoch+1}: Loss = {total_loss:.4f}")
-
-    # 8. Save the model
+    # 9. Save model and tokenizer
     model_path = "chatbot_transformer.pth"
-    torch.save(model.state_dict(), model_path)
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'tokenizer_path': 'chat_tokenizer.json',
+        'vocab_size': vocab_size,
+        'config': {
+            'd_model': 256,
+            'n_layers': 2,
+            'n_heads': 4,
+            'd_ff': 1024
+        }
+    }, model_path)
+
     print("✅ Model saved to:", os.path.abspath(model_path))
+    print("Training completed!")
